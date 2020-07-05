@@ -1,0 +1,144 @@
+# BUGGIFY
+
+Simulation has built-in support for injecting low-level failures, and thus can productively discover failures of low-level components.  As lower-level abstractions are assembled into a higher-level system, simulation will lose effectiveness in finding high-level failures by injecting low-level bugs.  `BUGGIFY` bridges the gap to allow random injection of abstract, system component failures.
+
+<br/> <hr /> <br />
+
+### Behavior
+
+FoundationDB's correctness is validated with a deterministic simulation framework that productively fuzzes faults against a specification of the system's behavior.
+
+When I've seen discussions of FDB's testing in the wild, the focus has always been on the first part: the deterministic simulation framework.  This is likely due to Will Wilson's fantastic talk on the subject, ["Testing Distributed Systems with Deterministic Simulation"][strangeloop-waw], focusing mainly on that first part.  An important beginning, but not the whole story.
+
+A deterministic simulation framework with random fault injection provides a testing framework that _can_ find bugs.  However, the question is how quickly?  If validating the correctness of a network protocol or storage engine, then network or disk fault injection alone would be sufficient to give a high degree of confidence in correctness.  The types of dangerous conditions that the code must correctly handle, such as network instability or disk corruption, exactly match what the simulator directly produces.
+
+When building full, higher level, distributed systems, there's no longer an exact match between what the simulator can easily produce and the dangerous situations that discover bugs.  What's the chance of random packet loss causing a minimal quorum to be used in two consecutive Raft leader elections?  What's the chance that random connection drops causes a duplicate request to be sent a minute later?  It's still _possible_ for these bugs to be discovered, however, it'd take a tremendous number of simulation runs to stumble upon one of these higher-level dangerous situations.  This poor ratio of testing time to coverage, We've lost the "productively" in our original description of simulation testing.  What is needed is a way to enable the simulator to directly produce failures in higher level components or APIs.
+
+How FoundationDB does this is with the `BUGGIFY` macro.  `BUGGIFY` exists to bias the simulator towards doing dangerous, bug-finding things.  It is the main tool that differentiates FDB's simulation testing from other black box solutions.  Instead of writing FoundationDB and then trying to validated it against a separate blackbox testing solution afterwards, FoundationDB was written to explicitly cooperate with the simulator by instrumenting its code with descriptions of how to cause failures in each component of the system.
+
+`BUGGIFY` has the following rules:
+
+1. `BUGGIFY` only ever evaluates to true when run in simulation.
+2. The first time each `BUGGIFY` use is evaluated, it is either enabled or disabled for the entire simulation run.
+3. Enabled uses of `BUGGIFY` have a 5% chance of evaluating to true (or custom, e.g. `BUGGIFY_WITH_PROB(0.001)` == 0.1% chance).
+
+In FoundationDB all test code and `BUGGIFY` fault injection code is compiled into the exact binary that is published as the official binary and run in production.  (1) promising that `BUGGIFY` will only ever evaluate to true within simulation is what provides us with the sense of safety and confidence to liberally sprinkle fault injection code inline with our critical production code.
+
+(2) and (3) are both different ways of requesting "do bad things, but not too many of them". Viewing each `BUGGIFY` usage as a different potential type of fault, simulation selects a random subset of the potential faults to inject for a given run.  For the enabled `BUGGIFY` lines, we don't wish to force an error handling case in _every_ run, as that might prevent the system from making forward progress.  5% was an arbitrarily chosen default for "infrequent but not too infrequent".
+
+[strangeloop-waw]: https://youtu.be/4fFDFbi3toc
+
+<br /> <hr /> <br />
+
+### Usage
+
+##### High-level Fault Injection
+
+1. High level faults
+    1. Don't do work that's not strictly required for correctness
+    1. 
+    2. Pretend fail after success
+
+As a last grouping, `if (BUGGIFY) wait(delay(5));` or `wait(delay( BUGGIFY ? 1, 0.001 ));` are reasonably common patterns in complex, concurrent code.  `delay()` itself is already equipped with a `BUGGIFY` to randomly lengthen the sleep duration, but due to `delay()`'s pervasive use across the codebase, it's set to a low chance of happening to avoid drastically lengthening test duration with sleeps.  Inserting additional delays at a higher level allows emphasizing those operations which might be vulnerable to delays.
+
+As a concrete example, a FoundationDB transaction log will sometimes wait 
+
+```cpp
+if (isDisplaced) {
+    // This TLog was removed from the database.
+    if (BUGGIFY) wait( delay( SERVER_KNOBS->BUGGIFY_WORKER_REMOVED_MAX_LAG * deterministicRandom()->random01() ) );
+    throw worker_removed();
+}
+```
+
+Which allows simulation to more frequently test what happens if transaction logs stay as participants in the cluster longer than they're supposed to.
+
+##### Randomizing Tuning Knobs
+
+FoundationDB has a large collection of tuning knobs that can be used to fine tune FoundationDB's behavior to a particular deployment environment.  (748 of them at the time of writing.)  With these, one would wish some degree of testing that changing their default values is safe, and that changing a combination of them together is still safe.  The tuning knob initialization code uses `BUGGIFY` to randomize the tuning configuration.
+
+This could be to choose a random setting for a single knob:
+```cpp
+init( DESIRED_TEAMS_PER_SERVER, 5 );
+if( randomize && BUGGIFY )
+    DESIRED_TEAMS_PER_SERVER = deterministicRandom()->random  Int(1, 10);
+```
+
+To verify that code hidden behind a feature flag is tested:
+```cpp
+init( LOG_ROUTER_PEEK_FROM_SATELLITES_PREFERRED, 1 );
+if( randomize && BUGGIFY )
+    LOG_ROUTER_PEEK_FROM_SATELLITES_PREFERRED = 0;
+``` 
+
+To make sure that default knob settings aren't masking bugs:
+```cpp
+init( DD_MOVE_KEYS_PARALLELISM, 15 );
+if( randomize && BUGGIFY )
+  DD_MOVE_KEYS_PARALLELISM = 1;
+```
+
+To force code that handles edge cases to run frequently:
+```cpp
+init( MAX_COMMIT_UPDATES, 2000 );
+if( randomize && BUGGIFY )
+    MAX_COMMIT_UPDATES = 1;
+```
+
+Or used to set a group of related knobs together:
+```cpp
+bool smallTlogTarget = randomize && BUGGIFY;
+init( TARGET_BYTES_PER_TLOG,        2400e6 );
+if( smallTlogTarget ) TARGET_BYTES_PER_TLOG = 2000e3;
+init( SPRING_BYTES_TLOG,             400e6 );
+if( smallTlogTarget ) SPRING_BYTES_TLOG = 200e3;
+init( TARGET_BYTES_PER_TLOG_BATCH,  1400e6 );
+if( smallTlogTarget ) TARGET_BYTES_PER_TLOG_BATCH = 1400e3;
+init( SPRING_BYTES_TLOG_BATCH,       300e6 );
+if( smallTlogTarget ) SPRING_BYTES_TLOG_BATCH = 150e3;
+```
+
+Some of these tuning knobs would have otherwise been hardcoded constants, but promoting them to a tuning knob was an easy way to allow their value to be subjected to `BUGGIFY`.
+
+Knob configuration globally affects all code in the simulation test for the duration of the test.  Some instances might wish to `BUGGIFY` per instance or use:
+
+```cpp
+// Knobs.cpp
+init( FETCH_BLOCK_BYTES,               2e6 );
+init( BUGGIFY_BLOCK_BYTES,            10000 );
+
+// storageserver.actor.cpp
+state int fetchBlockBytes = BUGGIFY ? SERVER_KNOBS->BUGGIFY_BLOCK_BYTES : SERVER_KNOBS->FETCH_BLOCK_BYTES;
+```
+
+Or set per object instantiated:
+
+```cpp
+class RawDiskQueue_TwoFiles {
+  public:
+  RawDiskQueue_TwoFiles( /* parameters elided */ )
+    : fileExtensionBytes(SERVER_KNOBS->DISK_QUEUE_FILE_EXTENSION_BYTES) {
+      if (BUGGIFY) {
+        fileExtensionBytes = _PAGE_SIZE * deterministicRandom()->randomSkewedUInt32( 1, 10<<10 );
+      }
+  }
+};
+```
+
+Which in the end is to say: take all the constants and tuning knobs in your program, and `BUGGIFY` them either into a range of plausible production values, or a range of values that will increase testing coverage of the feature they control.  Use whichever trick illustrated above that gets you the most coverage.
+
+##### Damage Control
+
+As a last note on `BUGGIFY`, the goal of fault injection testing is to cause chaos, and then enforce that the system can correctly recover.  We random background fault injection, we need to define a point in time where the goal of the test becomes more about allowing the system to recover and end the test, than causing chaos.
+
+This point is defined in FoundationDB as 300 seconds into a test, `g_simulator.speedUpSimulation` is set to true.  Various `BUGGIFY` lines that can cause extensive failures are instead written as
+
+```cpp
+if (g_network->isSimulated() &&
+    g_simulator.speedUpSimulation &&
+    BUGGIFY_WITH_PROB(0.0001)) {
+  throw master_recovery_failed();
+}
+```
+
+So that they disable themselves once our goal is finishing the test, and not injecting as many failures as possible.

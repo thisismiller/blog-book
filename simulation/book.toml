@@ -1,0 +1,6 @@
+[book]
+authors = ["Alex Miller"]
+language = "en"
+multilingual = false
+src = "src"
+title = "Testing Distributed Systems with Deterministic Simulation"
