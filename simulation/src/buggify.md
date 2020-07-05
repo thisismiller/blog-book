@@ -1,9 +1,5 @@
 # BUGGIFY
 
-Simulation has built-in support for injecting low-level failures, and thus can productively discover failures of low-level components.  As lower-level abstractions are assembled into a higher-level system, simulation will lose effectiveness in finding high-level failures by injecting low-level bugs.  `BUGGIFY` bridges the gap to allow random injection of abstract, system component failures.
-
-<br/> <hr /> <br />
-
 ### Behavior
 
 FoundationDB's correctness is validated with a deterministic simulation framework that productively fuzzes faults against a specification of the system's behavior.
@@ -32,16 +28,44 @@ In FoundationDB all test code and `BUGGIFY` fault injection code is compiled int
 
 ### Usage
 
-##### High-level Fault Injection
+##### Performing Minimal Work
 
-1. High level faults
-    1. Don't do work that's not strictly required for correctness
-    1. 
-    2. Pretend fail after success
+Situations where work is optional, or done asynchronously after a reply has already been sent, are great opportunities to `BUGGIFY` in not doing the extra work.
 
-As a last grouping, `if (BUGGIFY) wait(delay(5));` or `wait(delay( BUGGIFY ? 1, 0.001 ));` are reasonably common patterns in complex, concurrent code.  `delay()` itself is already equipped with a `BUGGIFY` to randomly lengthen the sleep duration, but due to `delay()`'s pervasive use across the codebase, it's set to a low chance of happening to avoid drastically lengthening test duration with sleeps.  Inserting additional delays at a higher level allows emphasizing those operations which might be vulnerable to delays.
+```cpp
+// Ask all coordinators if the worker is considered as a leader (leader nominee) by the coordinator.
+int quorumSize = BUGGIFY ? clientLeaderServers.size()/2+1 : clientLeaderServers.size();
+for(int i=0; i<clientLeaderServers.size(); i++) {
+  actors.push_back( i<quorumSize ? monitorNominee( clusterKey, clientLeaderServers[i], &nomineeChange, &nominees[i] ) : Never() );
+}
+```
 
-As a concrete example, a FoundationDB transaction log will sometimes wait 
+Which causes leader information to be pulled from a minimal Paxos quorum rather than sending requests to all coordinators.
+
+(The minimal quorum needs to be a minimal quorum of alive nodes, such that the system should be able to make forward progress.  When simulation tests are configured to kill processes, this minimal quorum logic needs to restrict itself to only the nodes simulation thinks should be alive.)
+
+##### Forcing Error Handling
+
+Some conditions that detect exceptional cases have `|| BUGGIFY` added to the end of them.
+
+ ```cpp
+if(self->cursor->popped() != 0 ||
+   (BUGGIFY_WITH_PROB(0.01) && !self->hasDiscardedData)) {
+    TEST(true); //disk adapter reset
+    TraceEvent(SevWarnAlways, "DiskQueueAdapterReset").detail("Version", self->cursor->popped());
+    // ...
+    self->hasDiscardedData = true;
+    throw disk_adapter_reset();
+}
+```
+
+Which detects the case where part way through reading data, we're told that the data we want has been removed, and we need to restart reading at a higher version.  The situation that produces this error is exceptionally rare, so to make sure that the code is well tested, we occasionally pretend that a successful read actually indicated that a restart was necessary. 
+
+##### Emphasizing Concurrent
+
+Injecting or lengthening sleeps, `if (BUGGIFY) wait(delay(5));` or `wait(delay( BUGGIFY ? 1, 0.001 ));`, are reasonably common patterns in complex, concurrent code.  `delay()` itself is already equipped with a `BUGGIFY` to randomly lengthen the sleep duration, but due to `delay()`'s pervasive use across the codebase, it's set to a low chance of happening to avoid drastically prolonging test duration with sleeps.  Inserting additional delays at a higher level allows emphasizing those operations which might be vulnerable to delays.
+
+As a concrete example, rather than entirely relying on random packet delays, a FoundationDB transaction log will sometimes pretend it didn't hear the reply that it should kill itself:
 
 ```cpp
 if (isDisplaced) {
@@ -129,9 +153,9 @@ Which in the end is to say: take all the constants and tuning knobs in your prog
 
 ##### Damage Control
 
-As a last note on `BUGGIFY`, the goal of fault injection testing is to cause chaos, and then enforce that the system can correctly recover.  We random background fault injection, we need to define a point in time where the goal of the test becomes more about allowing the system to recover and end the test, than causing chaos.
+As a last note on `BUGGIFY`, the goal of fault injection testing is to cause chaos, and then enforce that the system can correctly recover.  As the fault injection occurs randomly in the background, we need to define a point in time where the goal of the test becomes more about allowing the system to recover and end the test, than causing chaos.
 
-This point is defined in FoundationDB as 300 seconds into a test, `g_simulator.speedUpSimulation` is set to true.  Various `BUGGIFY` lines that can cause extensive failures are instead written as
+This point is defined in FoundationDB as 300 (simulated) seconds into a test, `g_simulator.speedUpSimulation` is set to true.  Various `BUGGIFY` lines that can cause extensive failures are instead written as
 
 ```cpp
 if (g_network->isSimulated() &&
