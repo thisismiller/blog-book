@@ -1,0 +1,34 @@
+name: CI/CD
+
+on:
+  pull_request:
+  push:
+    branches: [trunk]
+
+jobs:
+  stack:
+    name: 'Build and Push'
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+      if: github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.ref == 'refs/heads/trunk'
+
+    - name: Setup mdBook
+      uses: peaceiris/actions-mdbook@v1
+      with:
+        mdbook-version: '0.4.1'
+
+    - name: Generate site
+      run: |
+        mkdir -p _site/simulation
+        mdbook --dest-dir=site/simulation simulation
+
+    - uses: JamesIves/github-pages-deploy-action@releases/v3
+      name: Push site
+      with:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        BRANCH: gh-pages
+        FOLDER: _site
+
