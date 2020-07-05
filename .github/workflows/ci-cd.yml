@@ -23,7 +23,7 @@ jobs:
     - name: Generate site
       run: |
         mkdir -p _site/simulation
-        mdbook --dest-dir=site/simulation simulation
+        mdbook build --dest-dir=../_site/simulation simulation
 
     - uses: JamesIves/github-pages-deploy-action@releases/v3
       name: Push site
