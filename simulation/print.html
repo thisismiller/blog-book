@@ -91,7 +91,7 @@
 
         <nav id="sidebar" class="sidebar" aria-label="Table of contents">
             <div class="sidebar-scrollbox">
-                <ol class="chapter"><li class="chapter-item expanded "><a href="index.html"><strong aria-hidden="true">1.</strong> Index</a></li><li class="chapter-item expanded "><strong aria-hidden="true">2.</strong> Fault Injection</li><li><ol class="section"><li class="chapter-item expanded "><strong aria-hidden="true">2.1.</strong> System Faults</li><li class="chapter-item expanded "><a href="buggify.html"><strong aria-hidden="true">2.2.</strong> BUGGIFY</a></li></ol></li></ol>
+                <ol class="chapter"><li class="chapter-item expanded "><a href="index.html"><strong aria-hidden="true">1.</strong> Index</a></li><li class="chapter-item expanded "><a href="buggify.html"><strong aria-hidden="true">2.</strong> BUGGIFY</a></li></ol>
             </div>
             <div id="sidebar-resize-handle" class="sidebar-resize-handle"></div>
         </nav>
@@ -165,8 +165,6 @@ effectiveness in finding high-level failures by injecting low-level bugs.
 <code>BUGGIFY</code> bridges the gap to allow random injection of abstract, system
 component failures.</p>
 <h1><a class="header" href="#buggify" id="buggify">BUGGIFY</a></h1>
-<p>Simulation has built-in support for injecting low-level failures, and thus can productively discover failures of low-level components.  As lower-level abstractions are assembled into a higher-level system, simulation will lose effectiveness in finding high-level failures by injecting low-level bugs.  <code>BUGGIFY</code> bridges the gap to allow random injection of abstract, system component failures.</p>
-<p><br/> <hr /> <br /></p>
 <h3><a class="header" href="#behavior" id="behavior">Behavior</a></h3>
 <p>FoundationDB's correctness is validated with a deterministic simulation framework that productively fuzzes faults against a specification of the system's behavior.</p>
 <p>When I've seen discussions of FDB's testing in the wild, the focus has always been on the first part: the deterministic simulation framework.  This is likely due to Will Wilson's fantastic talk on the subject, <a href="https://youtu.be/4fFDFbi3toc">&quot;Testing Distributed Systems with Deterministic Simulation&quot;</a>, focusing mainly on that first part.  An important beginning, but not the whole story.</p>
@@ -183,18 +181,31 @@ component failures.</p>
 <p>(2) and (3) are both different ways of requesting &quot;do bad things, but not too many of them&quot;. Viewing each <code>BUGGIFY</code> usage as a different potential type of fault, simulation selects a random subset of the potential faults to inject for a given run.  For the enabled <code>BUGGIFY</code> lines, we don't wish to force an error handling case in <em>every</em> run, as that might prevent the system from making forward progress.  5% was an arbitrarily chosen default for &quot;infrequent but not too infrequent&quot;.</p>
 <p><br /> <hr /> <br /></p>
 <h3><a class="header" href="#usage" id="usage">Usage</a></h3>
-<h5><a class="header" href="#high-level-fault-injection" id="high-level-fault-injection">High-level Fault Injection</a></h5>
-<ol>
-<li>High level faults
-<ol>
-<li>Don't do work that's not strictly required for correctness</li>
-<li></li>
-<li>Pretend fail after success</li>
-</ol>
-</li>
-</ol>
-<p>As a last grouping, <code>if (BUGGIFY) wait(delay(5));</code> or <code>wait(delay( BUGGIFY ? 1, 0.001 ));</code> are reasonably common patterns in complex, concurrent code.  <code>delay()</code> itself is already equipped with a <code>BUGGIFY</code> to randomly lengthen the sleep duration, but due to <code>delay()</code>'s pervasive use across the codebase, it's set to a low chance of happening to avoid drastically lengthening test duration with sleeps.  Inserting additional delays at a higher level allows emphasizing those operations which might be vulnerable to delays.</p>
-<p>As a concrete example, a FoundationDB transaction log will sometimes wait </p>
+<h5><a class="header" href="#performing-minimal-work" id="performing-minimal-work">Performing Minimal Work</a></h5>
+<p>Situations where work is optional, or done asynchronously after a reply has already been sent, are great opportunities to <code>BUGGIFY</code> in not doing the extra work.</p>
+<pre><code class="language-cpp">// Ask all coordinators if the worker is considered as a leader (leader nominee) by the coordinator.
+int quorumSize = BUGGIFY ? clientLeaderServers.size()/2+1 : clientLeaderServers.size();
+for(int i=0; i&lt;clientLeaderServers.size(); i++) {
+  actors.push_back( i&lt;quorumSize ? monitorNominee( clusterKey, clientLeaderServers[i], &amp;nomineeChange, &amp;nominees[i] ) : Never() );
+}
+</code></pre>
+<p>Which causes leader information to be pulled from a minimal Paxos quorum rather than sending requests to all coordinators.</p>
+<p>(The minimal quorum needs to be a minimal quorum of alive nodes, such that the system should be able to make forward progress.  When simulation tests are configured to kill processes, this minimal quorum logic needs to restrict itself to only the nodes simulation thinks should be alive.)</p>
+<h5><a class="header" href="#forcing-error-handling" id="forcing-error-handling">Forcing Error Handling</a></h5>
+<p>Some conditions that detect exceptional cases have <code>|| BUGGIFY</code> added to the end of them.</p>
+<pre><code class="language-cpp">if(self-&gt;cursor-&gt;popped() != 0 ||
+  (BUGGIFY_WITH_PROB(0.01) &amp;&amp; !self-&gt;hasDiscardedData)) {
+   TEST(true); //disk adapter reset
+   TraceEvent(SevWarnAlways, &quot;DiskQueueAdapterReset&quot;).detail(&quot;Version&quot;, self-&gt;cursor-&gt;popped());
+   // ...
+   self-&gt;hasDiscardedData = true;
+   throw disk_adapter_reset();
+}
+</code></pre>
+<p>Which detects the case where part way through reading data, we're told that the data we want has been removed, and we need to restart reading at a higher version.  The situation that produces this error is exceptionally rare, so to make sure that the code is well tested, we occasionally pretend that a successful read actually indicated that a restart was necessary. </p>
+<h5><a class="header" href="#emphasizing-concurrent" id="emphasizing-concurrent">Emphasizing Concurrent</a></h5>
+<p>Injecting or lengthening sleeps, <code>if (BUGGIFY) wait(delay(5));</code> or <code>wait(delay( BUGGIFY ? 1, 0.001 ));</code>, are reasonably common patterns in complex, concurrent code.  <code>delay()</code> itself is already equipped with a <code>BUGGIFY</code> to randomly lengthen the sleep duration, but due to <code>delay()</code>'s pervasive use across the codebase, it's set to a low chance of happening to avoid drastically prolonging test duration with sleeps.  Inserting additional delays at a higher level allows emphasizing those operations which might be vulnerable to delays.</p>
+<p>As a concrete example, rather than entirely relying on random packet delays, a FoundationDB transaction log will sometimes pretend it didn't hear the reply that it should kill itself:</p>
 <pre><code class="language-cpp">if (isDisplaced) {
     // This TLog was removed from the database.
     if (BUGGIFY) wait( delay( SERVER_KNOBS-&gt;BUGGIFY_WORKER_REMOVED_MAX_LAG * deterministicRandom()-&gt;random01() ) );
@@ -257,8 +268,8 @@ state int fetchBlockBytes = BUGGIFY ? SERVER_KNOBS-&gt;BUGGIFY_BLOCK_BYTES : SER
 </code></pre>
 <p>Which in the end is to say: take all the constants and tuning knobs in your program, and <code>BUGGIFY</code> them either into a range of plausible production values, or a range of values that will increase testing coverage of the feature they control.  Use whichever trick illustrated above that gets you the most coverage.</p>
 <h5><a class="header" href="#damage-control" id="damage-control">Damage Control</a></h5>
-<p>As a last note on <code>BUGGIFY</code>, the goal of fault injection testing is to cause chaos, and then enforce that the system can correctly recover.  We random background fault injection, we need to define a point in time where the goal of the test becomes more about allowing the system to recover and end the test, than causing chaos.</p>
-<p>This point is defined in FoundationDB as 300 seconds into a test, <code>g_simulator.speedUpSimulation</code> is set to true.  Various <code>BUGGIFY</code> lines that can cause extensive failures are instead written as</p>
+<p>As a last note on <code>BUGGIFY</code>, the goal of fault injection testing is to cause chaos, and then enforce that the system can correctly recover.  As the fault injection occurs randomly in the background, we need to define a point in time where the goal of the test becomes more about allowing the system to recover and end the test, than causing chaos.</p>
+<p>This point is defined in FoundationDB as 300 (simulated) seconds into a test, <code>g_simulator.speedUpSimulation</code> is set to true.  Various <code>BUGGIFY</code> lines that can cause extensive failures are instead written as</p>
 <pre><code class="language-cpp">if (g_network-&gt;isSimulated() &amp;&amp;
     g_simulator.speedUpSimulation &amp;&amp;
     BUGGIFY_WITH_PROB(0.0001)) {
